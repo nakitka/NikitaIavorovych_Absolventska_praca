@@ -1,0 +1,182 @@
+# Gitea Act Runner Deployment for Kubernetes
+# Based on official example: https://gitea.com/gitea/act_runner/src/branch/main/examples/kubernetes
+#
+# Uses Docker-in-Docker (DinD) approach with TLS communication between containers
+# Registration token must be obtained from Gitea admin panel:
+# Site Administration -> Actions -> Runners -> Create new Runner
+#
+# Note: DinD requires privileged containers - this is a security consideration
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: runner-secret
+  namespace: {{ NAMESPACES.gitea }}
+type: Opaque
+stringData:
+  # Registration token - obtain from Gitea admin panel
+  # Site Administration -> Actions -> Runners -> Create new Runner
+  token: "{{ passwords.gitea_runner_token }}"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: runner-config
+  namespace: {{ NAMESPACES.gitea }}
+data:
+  config.yaml: |
+    log:
+      level: info
+
+    runner:
+      file: .runner
+      capacity: 2
+      timeout: 3h
+      insecure: false
+      fetch_timeout: 5s
+      fetch_interval: 2s
+      labels:
+        - "ubuntu-latest:docker://node:20-bookworm"
+        - "ubuntu-22.04:docker://node:20-bookworm"
+        - "linux:docker://debian:bookworm"
+
+    cache:
+      enabled: true
+      dir: /data/cache
+
+    container:
+      network: ""
+      privileged: false
+      options:
+      workdir_parent:
+      valid_volumes: []
+      docker_host: ""
+      force_pull: false
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: act-runner
+  namespace: {{ NAMESPACES.gitea }}
+  labels:
+    app: act-runner
+spec:
+  replicas: {{ applications.gitea_runner.replicas | default(3) }}
+  selector:
+    matchLabels:
+      app: act-runner
+  template:
+    metadata:
+      labels:
+        app: act-runner
+    spec:
+      restartPolicy: Always
+
+      # Schedule only on worker nodes, spread across nodes
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: act-runner
+                topologyKey: kubernetes.io/hostname
+
+      volumes:
+        - name: docker-certs
+          emptyDir: {}
+        - name: runner-data
+          emptyDir:
+            sizeLimit: 10Gi
+        - name: runner-config
+          configMap:
+            name: runner-config
+
+      containers:
+        # Docker daemon container (DinD)
+        - name: docker
+          image: docker:27-dind
+          env:
+            - name: DOCKER_TLS_CERTDIR
+              value: /certs
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: docker-certs
+              mountPath: /certs
+
+        # Act runner container
+        - name: runner
+          image: gitea/act_runner:latest
+          command:
+            - sh
+            - -c
+            - |
+              while ! nc -z localhost 2376; do
+                echo "Waiting for Docker daemon..."
+                sleep 5
+              done
+
+              # Register if not already registered
+              if [ ! -f /data/.runner ]; then
+                act_runner register \
+                  --instance "$GITEA_INSTANCE_URL" \
+                  --token "$GITEA_RUNNER_REGISTRATION_TOKEN" \
+                  --name "$(hostname)" \
+                  --labels "ubuntu-latest,ubuntu-22.04,linux" \
+                  --no-interactive
+              fi
+
+              # Start the runner daemon
+              act_runner daemon --config /config/config.yaml
+          env:
+            - name: DOCKER_HOST
+              value: tcp://localhost:2376
+            - name: DOCKER_CERT_PATH
+              value: /certs/client
+            - name: DOCKER_TLS_VERIFY
+              value: "1"
+            - name: GITEA_INSTANCE_URL
+              value: "http://gitea-http.{{ NAMESPACES.gitea }}.svc.cluster.local:3000"
+            - name: GITEA_RUNNER_REGISTRATION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: runner-secret
+                  key: token
+          volumeMounts:
+            - name: docker-certs
+              mountPath: /certs
+            - name: runner-data
+              mountPath: /data
+            - name: runner-config
+              mountPath: /config
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "1"
+
+---
+# PodDisruptionBudget for HA
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: act-runner-pdb
+  namespace: {{ NAMESPACES.gitea }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: act-runner

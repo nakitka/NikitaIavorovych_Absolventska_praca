@@ -1,0 +1,27 @@
+# Gitea shared storage using hostPath to GlusterFS mount
+# This provides RWX semantics since GlusterFS is mounted on all nodes
+# Only PV is created here - PVC is managed by Helm
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: gitea-shared-storage-pv
+  labels:
+    type: gitea-storage
+spec:
+  capacity:
+    storage: {{ applications.gitea.repository_storage_gb }}Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: gitea-glusterfs
+  hostPath:
+    path: /mnt/glusterfs/gitea
+    type: DirectoryOrCreate
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gitea-glusterfs
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer

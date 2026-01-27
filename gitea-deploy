@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""
+Gitea Production Infrastructure Deployment CLI
+
+Usage:
+    ./gitea-deploy --create-config          Create a new configuration interactively
+    ./gitea-deploy --config FILE            Run deployment with specified config
+    ./gitea-deploy --list-configs           List available configurations
+    ./gitea-deploy --validate FILE          Validate configuration without deploying
+    ./gitea-deploy --config FILE --non-interactive  Run without interactive pauses
+"""
+
+import os
+import sys
+import argparse
+from pathlib import Path
+from datetime import datetime
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+
+from src.config import DeploymentConfig, ConfigManager
+from src.validators import validate_deployment, ConfigValidator, PreflightValidator
+from src.orchestrator import DeploymentOrchestrator
+from src.reporters import DeploymentReporter
+from src.discovery import VSphereDiscovery
+from src.utils import setup_logging, get_logger, confirm_action
+
+console = Console()
+
+
+def print_banner():
+    """Print application banner."""
+    banner = """
+    ╔═══════════════════════════════════════════════════════════════╗
+    ║     GITEA PRODUCTION INFRASTRUCTURE DEPLOYMENT                ║
+    ║                                                               ║
+    ║  Automated deployment for 10-VM Gitea infrastructure          ║
+    ║  using Packer, Terraform, Ansible, and Helm                   ║
+    ╚═══════════════════════════════════════════════════════════════╝
+    """
+    console.print(banner, style="bold blue")
+
+
+def create_config(args):
+    """Create a new configuration interactively."""
+    console.print("\n[bold]Creating New Configuration[/bold]\n")
+
+    config_manager = ConfigManager()
+
+    # Try to use vSphere discovery
+    discovery = None
+    try:
+        discovery = VSphereDiscovery()
+    except Exception:
+        console.print("[yellow]vSphere discovery not available, manual entry required[/yellow]")
+
+    # Create config interactively
+    config = config_manager.create_interactive(discovery)
+
+    # Get save path
+    default_name = f"{config.metadata.environment}.yaml"
+    config_name = console.input(f"\nConfiguration name [{default_name}]: ").strip()
+    if not config_name:
+        config_name = default_name
+    if not config_name.endswith(".yaml"):
+        config_name += ".yaml"
+
+    config_path = config_manager.config_dir / config_name
+
+    # Save configuration
+    saved_path = config_manager.save(config, str(config_path))
+
+    console.print(f"\n[green]Configuration saved to: {saved_path}[/green]")
+    console.print(f"\nTo deploy, run: [bold]./gitea-deploy --config {saved_path}[/bold]")
+
+
+def list_configs(args):
+    """List available configurations."""
+    config_manager = ConfigManager()
+    configs = config_manager.list_configs()
+
+    if not configs:
+        console.print("\n[yellow]No configurations found in ./configs/[/yellow]")
+        console.print("Create one with: [bold]./gitea-deploy --create-config[/bold]")
+        return
+
+    table = Table(title="Available Configurations")
+    table.add_column("#", style="cyan")
+    table.add_column("Name")
+    table.add_column("Created")
+    table.add_column("VMs")
+    table.add_column("vCPU")
+    table.add_column("RAM")
+    table.add_column("Status")
+
+    for i, config in enumerate(configs, 1):
+        if "error" in config:
+            table.add_row(
+                str(i),
+                config["name"],
+                "-",
+                "-",
+                "-",
+                "-",
+                f"[red]Error: {config['error']}[/red]"
+            )
+        else:
+            table.add_row(
+                str(i),
+                config["name"],
+                config.get("created_at", "-"),
+                str(config.get("total_vms", "-")),
+                str(config.get("total_vcpu", "-")),
+                f"{config.get('total_ram_gb', '-')}GB",
+                "[green]Ready[/green]"
+            )
+
+    console.print(table)
+
+    # Allow selection
+    if configs:
+        console.print("\nTo deploy a configuration:")
+        console.print("  [bold]./gitea-deploy --config configs/<name>.yaml[/bold]")
+
+
+def validate_config(args):
+    """Validate a configuration file."""
+    config_path = args.config
+
+    if not os.path.exists(config_path):
+        console.print(f"[red]Configuration file not found: {config_path}[/red]")
+        sys.exit(1)
+
+    console.print(f"\n[bold]Validating: {config_path}[/bold]\n")
+
+    try:
+        config_manager = ConfigManager()
+        config = config_manager.load(config_path)
+
+        # Run validation
+        result = validate_deployment(config, check_vsphere=not args.skip_vsphere)
+
+        # Display results
+        if result.valid:
+            console.print("[green]Configuration is valid![/green]\n")
+        else:
+            console.print("[red]Configuration has errors![/red]\n")
+
+        if result.errors:
+            console.print("[bold red]Errors:[/bold red]")
+            for error in result.errors:
+                console.print(f"  - {error}")
+            console.print()
+
+        if result.warnings:
+            console.print("[bold yellow]Warnings:[/bold yellow]")
+            for warning in result.warnings:
+                console.print(f"  - {warning}")
+            console.print()
+
+        if result.info:
+            console.print("[bold blue]Information:[/bold blue]")
+            for info in result.info:
+                console.print(f"  - {info}")
+            console.print()
+
+        # Display summary
+        reporter = DeploymentReporter(config)
+        reporter.display_config_summary()
+
+        return result.valid
+
+    except Exception as e:
+        console.print(f"[red]Validation failed: {e}[/red]")
+        sys.exit(1)
+
+
+def run_deployment(args):
+    """Run the deployment."""
+    config_path = args.config
+
+    if not os.path.exists(config_path):
+        console.print(f"[red]Configuration file not found: {config_path}[/red]")
+        sys.exit(1)
+
+    # Set up logging
+    log_file = f"logs/deployment-{datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
+    logger = setup_logging(
+        log_level="DEBUG" if args.verbose else "INFO",
+        log_file=log_file,
+    )
+
+    print_banner()
+
+    console.print(f"\n[bold]Loading configuration: {config_path}[/bold]\n")
+
+    try:
+        # Load configuration
+        config_manager = ConfigManager()
+        config = config_manager.load(config_path)
+
+        # Override interactive mode if specified
+        if args.non_interactive:
+            config.deployment.interactive_mode = False
+
+        # Display configuration summary
+        reporter = DeploymentReporter(config)
+        reporter.display_config_summary()
+
+        # Validate configuration
+        console.print("\n[bold]Validating configuration...[/bold]")
+        result = validate_deployment(config, check_vsphere=not args.skip_validation)
+
+        if not result.valid:
+            console.print("\n[red]Configuration validation failed:[/red]")
+            for error in result.errors:
+                console.print(f"  - {error}")
+            if not args.force:
+                console.print("\nUse --force to proceed anyway (not recommended)")
+                sys.exit(1)
+            console.print("\n[yellow]Proceeding despite errors (--force)[/yellow]")
+
+        if result.warnings:
+            console.print("\n[yellow]Warnings:[/yellow]")
+            for warning in result.warnings:
+                console.print(f"  - {warning}")
+
+        # Confirm deployment
+        if not args.non_interactive and not args.yes:
+            console.print()  # Add spacing before prompt
+            if not confirm_action("Proceed with deployment?", default=True):
+                console.print("Deployment cancelled.")
+                sys.exit(0)
+
+        # Run deployment
+        start_phase = getattr(args, 'start_phase', 1)
+        if start_phase > 1:
+            console.print(f"\n[bold]Starting deployment from phase {start_phase}...[/bold]\n")
+        else:
+            console.print("\n[bold]Starting deployment...[/bold]\n")
+
+        orchestrator = DeploymentOrchestrator(config)
+        deployment_start = datetime.now()
+
+        success = orchestrator.run_deployment(start_phase=start_phase)
+
+        deployment_end = datetime.now()
+
+        # Generate report
+        report_path = reporter.generate_report(
+            orchestrator.phase_results,
+            deployment_start,
+            deployment_end,
+        )
+
+        reporter.write_credentials_summary()
+
+        if success:
+            console.print(f"\n[green]Deployment completed successfully![/green]")
+            console.print(f"Report saved to: {report_path}")
+            sys.exit(0)
+        else:
+            console.print(f"\n[red]Deployment failed![/red]")
+            console.print(f"Check logs at: {log_file}")
+            console.print(f"Report saved to: {report_path}")
+            sys.exit(1)
+
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Deployment interrupted by user[/yellow]")
+        sys.exit(130)
+    except Exception as e:
+        logger.exception("Deployment failed with exception")
+        console.print(f"\n[red]Deployment failed: {e}[/red]")
+        sys.exit(1)
+
+
+def main():
+    """Main entry point."""
+    parser = argparse.ArgumentParser(
+        description="Gitea Production Infrastructure Deployment",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s --create-config                 Create a new configuration
+  %(prog)s --list-configs                  List available configurations
+  %(prog)s --config configs/prod.yaml      Deploy using configuration
+  %(prog)s --validate configs/prod.yaml    Validate configuration only
+  %(prog)s --config configs/prod.yaml -y   Deploy without confirmation
+        """,
+    )
+
+    # Main actions
+    action_group = parser.add_mutually_exclusive_group(required=True)
+    action_group.add_argument(
+        "--create-config",
+        action="store_true",
+        help="Create a new configuration interactively",
+    )
+    action_group.add_argument(
+        "--list-configs",
+        action="store_true",
+        help="List available configurations",
+    )
+    action_group.add_argument(
+        "--config",
+        metavar="FILE",
+        help="Configuration file to use for deployment",
+    )
+    action_group.add_argument(
+        "--validate",
+        metavar="FILE",
+        dest="validate_only",
+        help="Validate configuration without deploying",
+    )
+
+    # Deployment options
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Run without interactive pauses",
+    )
+    parser.add_argument(
+        "-y", "--yes",
+        action="store_true",
+        help="Skip confirmation prompts",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Proceed even if validation fails",
+    )
+    parser.add_argument(
+        "--skip-validation",
+        action="store_true",
+        help="Skip vSphere connectivity validation",
+    )
+    parser.add_argument(
+        "--skip-vsphere",
+        action="store_true",
+        help="Skip vSphere checks during validation",
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable verbose output",
+    )
+    parser.add_argument(
+        "--start-phase",
+        type=int,
+        choices=[1, 2, 3, 4, 5, 6],
+        default=1,
+        help="Start from specific phase (1=Packer, 2=Terraform, 3=Ansible, 4=Helm operators, 5=Apps, 6=Validate)",
+    )
+
+    args = parser.parse_args()
+
+    # Execute appropriate action
+    if args.create_config:
+        create_config(args)
+    elif args.list_configs:
+        list_configs(args)
+    elif args.validate_only:
+        args.config = args.validate_only
+        valid = validate_config(args)
+        sys.exit(0 if valid else 1)
+    elif args.config:
+        run_deployment(args)
+
+
+if __name__ == "__main__":
+    main()
