@@ -1,0 +1,196 @@
+# Create VM pipeline
+# Each student creates a branch (e.g. acihon-vm) and runs the workflow from it.
+# VMs are created in /dualDC/vm/GiteaVMS/rocnik_1/<username>/
+# Different branches = no auto-cancel between users.
+
+name: Create VM
+
+on:
+  workflow_dispatch:
+    inputs:
+      vm_name:
+        description: 'VM Name'
+        required: true
+        type: string
+      cpu:
+        description: 'Number of CPUs'
+        required: true
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '4'
+          - '8'
+      ram_gb:
+        description: 'RAM in GB'
+        required: true
+        type: choice
+        options:
+          - '2'
+          - '4'
+          - '8'
+          - '16'
+      template:
+        description: 'VM Template'
+        required: true
+        type: choice
+        options:
+          - 'ubuntu24.04-template'
+          - 'ubuntu22.04-template'
+          - 'ubuntu-template2'
+          - 'centos7-latest-template'
+          - 'k8s-template-containerd'
+          - 'k8s-template'
+      network:
+        description: 'vSphere Network'
+        required: true
+        type: choice
+        options:
+          - '1.r_LINUX'
+          - '1.r_WINDOWS'
+          - '1.r_DHCP'
+          - '2.r_LINUX'
+          - '2.r_WINDOWS'
+          - '2.r_ADS'
+          - '2.r_VoIP'
+          - '3.r_ADS'
+          - '3.r_PROJECTs'
+      datastore:
+        description: 'vSphere Datastore'
+        required: true
+        type: choice
+        options:
+          - '1.r_Linux'
+          - '1.r_WINDOWS'
+          - '2.r_LINUX'
+          - '2.r_WINDOWS'
+          - '2.r_ADS'
+          - '2.r_VoIP'
+          - '3.r_ADS'
+          - '3.r_PROJECTS'
+      resource_pool:
+        description: 'vSphere Resource Pool'
+        required: true
+        type: choice
+        options:
+          - '1.r_LINUX'
+          - '1.r_WINDOWS'
+          - '2.r_LINUX'
+          - '2.r_WINDOWS'
+          - '2.r_ADS'
+          - '2.r_VoIP'
+          - '3.r_ADS'
+          - '3.r_PROJECTs'
+          - '3.r_SIS'
+
+env:
+  GOVC_URL: "vlab.dual.edu"
+  GOVC_USERNAME: "niavorov"
+  GOVC_PASSWORD: ${{ secrets.VSPHERE_PASSWORD }}
+  GOVC_INSECURE: "true"
+  GOVC_DATACENTER: "dualDC"
+  ORG_FOLDER: "/dualDC/vm/GiteaVMS/rocnik_1"
+  TEMPLATE_FOLDER: "/dualDC/vm/pbarczi/templates"
+
+jobs:
+  create-vm:
+    runs-on: phobos
+    steps:
+      - name: Set user VM folder
+        run: |
+          USER_FOLDER="${{ env.ORG_FOLDER }}/${{ github.actor }}"
+          echo "USER_FOLDER=${USER_FOLDER}" >> $GITHUB_ENV
+          echo "VM folder: ${USER_FOLDER}"
+
+      - name: Validate inputs
+        run: |
+          echo "=== VM Creation Request ==="
+          echo "Organization: rocnik_1"
+          echo "User:          ${{ github.actor }}"
+          echo "VM Name:       ${{ inputs.vm_name }}"
+          echo "CPUs:          ${{ inputs.cpu }}"
+          echo "RAM:           ${{ inputs.ram_gb }} GB"
+          echo "Template:      ${{ inputs.template }}"
+          echo "Network:       ${{ inputs.network }}"
+          echo "Datastore:     ${{ inputs.datastore }}"
+          echo "Resource Pool: ${{ inputs.resource_pool }}"
+          echo "Folder:        ${{ env.USER_FOLDER }}"
+          echo "=========================="
+
+          if [[ ! "${{ inputs.vm_name }}" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+            echo "ERROR: VM name can only contain letters, numbers, hyphens and underscores"
+            exit 1
+          fi
+
+      - name: Ensure user VM folder exists
+        run: |
+          # Ensure org folder exists
+          ~/bin/govc folder.info "${{ env.ORG_FOLDER }}" 2>/dev/null || \
+            ~/bin/govc folder.create "${{ env.ORG_FOLDER }}"
+          # Ensure user subfolder exists
+          ~/bin/govc folder.info "${{ env.USER_FOLDER }}" 2>/dev/null || \
+            ~/bin/govc folder.create "${{ env.USER_FOLDER }}"
+
+      - name: Check template exists
+        run: |
+          ~/bin/govc vm.info "${{ env.TEMPLATE_FOLDER }}/${{ inputs.template }}" || {
+            echo "ERROR: Template '${{ inputs.template }}' not found"
+            echo "Available templates:"
+            ~/bin/govc ls "${{ env.TEMPLATE_FOLDER }}/"
+            exit 1
+          }
+
+      - name: Check VM does not already exist
+        run: |
+          FOUND=$(~/bin/govc find "${{ env.USER_FOLDER }}" -type m -name "${{ inputs.vm_name }}" 2>/dev/null)
+          if [ -n "$FOUND" ]; then
+            echo "ERROR: VM '${{ inputs.vm_name }}' already exists in ${{ github.actor }}'s folder"
+            exit 1
+          fi
+          echo "OK: VM name is available"
+
+      - name: Clone VM from template
+        run: |
+          echo "Cloning VM from ${{ inputs.template }}..."
+          ~/bin/govc vm.clone \
+            -vm "${{ env.TEMPLATE_FOLDER }}/${{ inputs.template }}" \
+            -folder "${{ env.USER_FOLDER }}" \
+            -ds "${{ inputs.datastore }}" \
+            -pool "/dualDC/host/dualCL/Resources/${{ inputs.resource_pool }}" \
+            -net "${{ inputs.network }}" \
+            -on=false \
+            "${{ inputs.vm_name }}"
+          echo "Clone complete"
+
+      - name: Configure VM resources
+        run: |
+          echo "Setting CPU=${{ inputs.cpu }}, RAM=${{ inputs.ram_gb }}GB..."
+          ~/bin/govc vm.change \
+            -vm "${{ env.USER_FOLDER }}/${{ inputs.vm_name }}" \
+            -c "${{ inputs.cpu }}" \
+            -m "$(( ${{ inputs.ram_gb }} * 1024 ))"
+          echo "Resources configured"
+
+      - name: Power on VM
+        run: |
+          echo "Powering on VM..."
+          ~/bin/govc vm.power -on "${{ env.USER_FOLDER }}/${{ inputs.vm_name }}"
+          echo "VM powered on successfully"
+
+      - name: Display VM IP
+        run: |
+          echo "Waiting for VM to obtain an IP address..."
+          IP=$(~/bin/govc vm.ip -wait=3m "${{ env.USER_FOLDER }}/${{ inputs.vm_name }}" 2>/dev/null) || true
+          echo ""
+          echo "========================================="
+          echo "  VM '${{ inputs.vm_name }}' is ready!"
+          echo "  User: ${{ github.actor }}"
+          echo "========================================="
+          ~/bin/govc vm.info "${{ env.USER_FOLDER }}/${{ inputs.vm_name }}"
+          echo ""
+          if [ -n "$IP" ]; then
+            echo "  IP Address: $IP"
+          else
+            echo "  IP Address: not yet available (check vSphere)"
+          fi
+          echo "========================================="
